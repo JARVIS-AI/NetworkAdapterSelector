@@ -10,15 +10,16 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using EasyHook;
 using NetworkAdapterSelector.Hook.UnManaged;
-using Process = System.Diagnostics.Process;
-using Socket = NetworkAdapterSelector.Hook.UnManaged.Socket;
-using SocketAddress = NetworkAdapterSelector.Hook.UnManaged.SocketAddress;
+using NetworkAdapterSelector.Hook.UnManaged.Interfaces;
+using NetworkAdapterSelector.Hook.UnManaged.Structures;
 
 namespace NetworkAdapterSelector.Hook
 {
+    /// <inheritdoc />
     /// <summary>
     ///     A class containing the code to be injected into the application
     /// </summary>
+    // ReSharper disable once ClassTooBig
     public sealed class Guest : IEntryPoint
     {
         // ReSharper disable once UnusedParameter.Local
@@ -29,6 +30,10 @@ namespace NetworkAdapterSelector.Hook
         /// <param name="adapterId"><see cref="string" /> identification of the desired network adapter</param>
         /// <param name="injectionGuessAddress">Address of the injection assembly to be used for child processes</param>
         /// <param name="injectionDelay">Number of milliseconds after child process creation to try to inject the code</param>
+        /// <param name="changeWindowTitle">
+        ///     A boolean value indicating if the title of the main windows of the process should be
+        ///     modified
+        /// </param>
         /// <param name="isInDebug">Indicates if injected code should create a log file and print activity information</param>
         // ReSharper disable once TooManyDependencies
         public Guest(
@@ -36,12 +41,15 @@ namespace NetworkAdapterSelector.Hook
             string adapterId,
             string injectionGuessAddress,
             int injectionDelay,
+            bool changeWindowTitle,
             bool isInDebug)
         {
             DebugMessage(
                 nameof(Guest),
+                null,
                 "Initializing ..."
             );
+            ChangeWindowTitle = changeWindowTitle;
             InjectionGuessAddress = injectionGuessAddress;
             InjectionDelay = injectionDelay;
             AdapterId = adapterId;
@@ -63,10 +71,12 @@ namespace NetworkAdapterSelector.Hook
 
         private IntPtr ActiveWindow { get; set; } = IntPtr.Zero;
         private string AdapterId { get; }
+        public bool ChangeWindowTitle { get; }
         private List<LocalHook> Hooks { get; } = new List<LocalHook>();
         private int InjectionDelay { get; }
         private string InjectionGuessAddress { get; }
         private string LogPath { get; }
+        public Dictionary<IntPtr, bool> SocketLookupTable { get; } = new Dictionary<IntPtr, bool>();
 
         /// <summary>
         ///     Starts the hooking process
@@ -88,17 +98,31 @@ namespace NetworkAdapterSelector.Hook
         {
             DebugMessage(
                 nameof(Run),
+                null,
                 "Starting ..."
             );
 
             LoadLibrary(@"ws2_32.dll", () =>
             {
-                AddHook(@"ws2_32.dll", "connect", new Delegates.ConnectDelegate(OnConnect));
-                AddHook(@"ws2_32.dll", "WSAConnect", new Delegates.WSAConnectDelegate(OnWSAConnect));
-                AddHook(@"ws2_32.dll", "bind", new Delegates.BindDelegate(OnBind));
+                AddHook(@"ws2_32.dll", @"socket", new Delegates.OpenDelegate(OnOpenSocket));
+                AddHook(@"ws2_32.dll", @"WSASocketA",
+                    new Delegates.WSAOpenDelegate((family, type, protocol, info, groupId, flags) =>
+                        OnWSAOpenSocket(family, type, protocol, info, groupId, flags, false)
+                    )
+                );
+                AddHook(@"ws2_32.dll", @"WSASocketW",
+                    new Delegates.WSAOpenDelegate((family, type, protocol, info, groupId, flags) =>
+                        OnWSAOpenSocket(family, type, protocol, info, groupId, flags, true)
+                    )
+                );
+                AddHook(@"ws2_32.dll", @"connect", new Delegates.ConnectDelegate(OnConnect));
+                AddHook(@"ws2_32.dll", @"WSAConnect", new Delegates.WSAConnectDelegate(OnWSAConnect));
+                AddHook(@"ws2_32.dll", @"bind", new Delegates.BindDelegate(OnBind));
+                // ReSharper disable once StringLiteralTypo
+                AddHook(@"ws2_32.dll", @"closesocket", new Delegates.CloseDelegate(OnCloseSocket));
             });
 
-            AddHook(@"kernel32.dll", "CreateProcessA",
+            AddHook(@"kernel32.dll", @"CreateProcessA",
                 new Delegates.CreateProcessDelegate(
                     (
                         IntPtr applicationName,
@@ -127,7 +151,7 @@ namespace NetworkAdapterSelector.Hook
                 )
             );
 
-            AddHook(@"kernel32.dll", "CreateProcessW",
+            AddHook(@"kernel32.dll", @"CreateProcessW",
                 new Delegates.CreateProcessDelegate(
                     (
                         IntPtr applicationName,
@@ -156,19 +180,22 @@ namespace NetworkAdapterSelector.Hook
                 )
             );
 
-            // Ansi version of the SetWindowText method
-            AddHook(@"user32.dll", "SetWindowTextA",
-                new Delegates.SetWindowTextDelegate(
-                    (handle, text) => OnSetWindowText(handle, text, false)
-                )
-            );
+            if (ChangeWindowTitle)
+            {
+                // Ansi version of the SetWindowText method
+                AddHook(@"user32.dll", @"SetWindowTextA",
+                    new Delegates.SetWindowTextDelegate(
+                        (handle, text) => OnSetWindowText(handle, text, false)
+                    )
+                );
 
-            // Unicode (Wide) version of the SetWindowText method
-            AddHook(@"user32.dll", "SetWindowTextW",
-                new Delegates.SetWindowTextDelegate(
-                    (handle, text) => OnSetWindowText(handle, text, true)
-                )
-            );
+                // Unicode (Wide) version of the SetWindowText method
+                AddHook(@"user32.dll", @"SetWindowTextW",
+                    new Delegates.SetWindowTextDelegate(
+                        (handle, text) => OnSetWindowText(handle, text, true)
+                    )
+                );
+            }
 
             // Return if we failed to hook any method
             lock (Hooks)
@@ -177,6 +204,7 @@ namespace NetworkAdapterSelector.Hook
                 {
                     DebugMessage(
                         nameof(Run),
+                        null,
                         "FATAL: Failed to hook any function."
                     );
 
@@ -187,8 +215,11 @@ namespace NetworkAdapterSelector.Hook
             // In case we started the application using CreateAndInject method
             RemoteHooking.WakeUpProcess();
 
-            // Going into a loop to update the application's main window's title bar
-            WindowTitleCheckLoop();
+            if (ChangeWindowTitle)
+            {
+                // Going into a loop to update the application's main window's title bar
+                WindowTitleCheckLoop();
+            }
         }
 
         private void AddHook(string libName, string entryPoint, Delegate newProcedure)
@@ -207,6 +238,7 @@ namespace NetworkAdapterSelector.Hook
 
                 DebugMessage(
                     nameof(AddHook),
+                    null,
                     "`{0}` @ `{1}` hooked successfully.",
                     entryPoint,
                     libName
@@ -214,9 +246,10 @@ namespace NetworkAdapterSelector.Hook
             }
             catch (Exception e)
             {
-                DebugMessage(nameof(AddHook), e.ToString());
+                DebugMessage(nameof(AddHook), null, e.ToString());
                 DebugMessage(
                     nameof(AddHook),
+                    null,
                     "Failed to hook `{0}` @ `{1}`.",
                     entryPoint,
                     libName
@@ -226,130 +259,20 @@ namespace NetworkAdapterSelector.Hook
 
         private SocketError BindSocketByAddress(IntPtr socket, ISocketAddress socketAddress)
         {
-            switch (socketAddress?.AddressFamily)
+            if (IsSpecialAddress(socket, socketAddress))
             {
-                case AddressFamily.InterNetwork:
+                return SocketError.Success;
+            }
 
-                    if (socketAddress.Address?.IPAddress?.Equals(IPAddress.Any) == true)
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [0.0.0.0]"
-                        );
+            if (IsSocketMarkedAsBinded(socket))
+            {
+                DebugMessage(
+                    nameof(BindSocketByAddress),
+                    socket,
+                    "Binding to interface skipped as the socket should be already binded."
+                );
 
-                        return SocketError.Success;
-                    }
-
-                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("127.0.0.0"),
-                        IPAddress.Parse("127.255.255.255")))
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [Loop Back]"
-                        );
-
-                        return SocketError.Success; // LoopBack
-                    }
-
-                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("10.0.0.0"),
-                        IPAddress.Parse("10.255.255.255")))
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [Private Range]"
-                        );
-
-                        return SocketError.Success; // Private Network
-                    }
-
-                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("172.16.0.0"),
-                        IPAddress.Parse("172.31.255.255")))
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [Private Range]"
-                        );
-
-                        return SocketError.Success; // Private Network
-                    }
-
-                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("192.168.0.0"),
-                        IPAddress.Parse("192.168.255.255")))
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [Private Range]"
-                        );
-
-                        return SocketError.Success; // Private Network
-                    }
-
-                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("169.254.1.0"),
-                        IPAddress.Parse("169.254.254.255")))
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [Link Local Network]"
-                        );
-
-                        return SocketError.Success; // Link Local Network
-                    }
-
-                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("224.0.0.0"),
-                        IPAddress.Parse("239.255.255.255")))
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [MultiCast Address]"
-                        );
-
-                        return SocketError.Success; // MultiCast
-                    }
-
-                    break;
-                case AddressFamily.InterNetworkV6:
-
-                    if (socketAddress.Address?.IPAddress?.Equals(IPAddress.IPv6Any) == true)
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [0000:]"
-                        );
-
-                        return SocketError.Success;
-                    }
-
-                    if (socketAddress.Address?.IPAddress?.Equals(IPAddress.IPv6Loopback) == true)
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [Loop Back]"
-                        );
-
-                        return SocketError.Success; // LoopBack
-                    }
-
-                    if (IsIpInRange(socketAddress.Address?.IPAddress,
-                        IPAddress.Parse("fc00:0000:0000:0000:0000:0000:0000:0000"),
-                        IPAddress.Parse("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")))
-                    {
-                        DebugMessage(
-                            nameof(BindSocketByAddress),
-                            "Binding to interface skipped due to the nature of passed IP Address. [fc00:]"
-                        );
-
-                        return SocketError.Success; // Unique Local Addresses, Private networks, MultiCast
-                    }
-
-                    break;
-                default:
-                    DebugMessage(
-                        nameof(BindSocketByAddress),
-                        "Binding to interface skipped due an unsupported address family of `{0}`.",
-                        socketAddress?.AddressFamily
-                    );
-
-                    return SocketError.Success;
+                return SocketError.Success;
             }
 
             var networkInterface = GetNetworkInterface();
@@ -358,7 +281,8 @@ namespace NetworkAdapterSelector.Hook
             if (networkInterface == null || interfaceAddress == null)
             {
                 DebugMessage(
-                    nameof(OnBind),
+                    nameof(BindSocketByAddress),
+                    socket,
                     "Binding for the `{0}:{1}` rejected due to lack of a valid interface address.",
                     socketAddress.Address?.IPAddress,
                     socketAddress.Port
@@ -378,12 +302,15 @@ namespace NetworkAdapterSelector.Hook
 
                 DebugMessage(
                     nameof(BindSocketByAddress),
+                    socket,
                     "Binding to `{0}:{1}` ...",
                     bindIn.Address?.IPAddress,
                     bindIn.Port
                 );
 
-                return Socket.Bind(socket, ref bindIn, Marshal.SizeOf(bindIn));
+                MarkSocketAsBinded(socket);
+
+                return NativeSocket.Bind(socket, ref bindIn, Marshal.SizeOf(bindIn));
             }
 
             if (interfaceAddress.AddressFamily == AddressFamily.InterNetworkV6)
@@ -402,16 +329,20 @@ namespace NetworkAdapterSelector.Hook
 
                 DebugMessage(
                     nameof(BindSocketByAddress),
+                    socket,
                     "Binding to `{0}:{1}` ...",
                     bindIn6.Address?.IPAddress,
                     bindIn6.Port
                 );
 
-                return Socket.Bind(socket, ref bindIn6, Marshal.SizeOf(bindIn6));
+                MarkSocketAsBinded(socket);
+
+                return NativeSocket.Bind(socket, ref bindIn6, Marshal.SizeOf(bindIn6));
             }
 
             DebugMessage(
                 nameof(BindSocketByAddress),
+                socket,
                 "Binding to interface skipped due an unsupported interface address family of `{0}`.",
                 interfaceAddress.AddressFamily
             );
@@ -419,37 +350,56 @@ namespace NetworkAdapterSelector.Hook
             return SocketError.Success;
         }
 
-        private void DebugMessage(string scope, string message, params object[] args)
+        // ReSharper disable once TooManyArguments
+        private void DebugMessage(string scope, IntPtr? socket, string message, params object[] args)
         {
-            var lastError = Socket.WSAGetLastError();
+            var lastError = NativeSocket.WSAGetLastError();
 
             try
             {
-                if (string.IsNullOrWhiteSpace(LogPath))
-                {
-                    return;
-                }
-
-                var space = Math.Max(15 - scope.Length, 0);
+                var space = Math.Max(20 - scope.Length, 0);
 
                 message = string.Format(
-                    "{0:s} - [`{1}`] : {2}{3}",
+                    "{0:s} - #{4:D8} [`{1}`] {2}{3}",
                     DateTime.UtcNow,
                     scope,
                     new string(' ', space),
-                    args?.Length > 0 ? string.Format(message, args) : message
+                    args?.Length > 0 ? string.Format(message, args) : message,
+                    socket?.ToInt64() ?? 0
                 );
 
+#if DEBUG
+            try
+            {
                 Debug.WriteLine(message);
+                Console.WriteLine(message);
+            }
+            catch
+            {
+                // ignored
+            }
+#endif
 
-                File.AppendAllText(LogPath, message + Environment.NewLine);
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(LogPath))
+                    {
+                        return;
+                    }
+
+                    File.AppendAllText(LogPath, message + Environment.NewLine);
+                }
+                catch
+                {
+                    // ignored
+                }
             }
             catch
             {
                 // ignored
             }
 
-            Socket.WSASetLastError(lastError);
+            NativeSocket.WSASetLastError(lastError);
         }
 
         private string GenerateCaptionText()
@@ -496,7 +446,7 @@ namespace NetworkAdapterSelector.Hook
         private NetworkInterface GetNetworkInterface()
         {
             return NetworkInterface.GetAllNetworkInterfaces()
-                .SingleOrDefault(
+                .FirstOrDefault(
                     @interface =>
                         @interface.Id.Equals(AdapterId, StringComparison.CurrentCultureIgnoreCase) &&
                         @interface.OperationalStatus == OperationalStatus.Up &&
@@ -512,7 +462,8 @@ namespace NetworkAdapterSelector.Hook
 
             try
             {
-                var socketAddress = (SocketAddress) Marshal.PtrToStructure(socketAddressPointer, typeof(SocketAddress));
+                var socketAddress =
+                    (SocketAddressBase) Marshal.PtrToStructure(socketAddressPointer, typeof(SocketAddressBase));
 
                 Type type;
 
@@ -541,6 +492,74 @@ namespace NetworkAdapterSelector.Hook
             {
                 return null;
             }
+        }
+
+        private bool IsInternalAddress(IntPtr socket, ISocketAddress socketAddress)
+        {
+            switch (socketAddress?.AddressFamily)
+            {
+                case AddressFamily.InterNetwork:
+
+                    if (socketAddress.Address?.IPAddress?.Equals(IPAddress.Any) == true)
+                    {
+                        DebugMessage(
+                            nameof(IsInternalAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [0.0.0.0]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("127.0.0.0"),
+                        IPAddress.Parse("127.255.255.255")))
+                    {
+                        DebugMessage(
+                            nameof(IsInternalAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [Loop Back]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    break;
+                case AddressFamily.InterNetworkV6:
+
+                    if (socketAddress.Address?.IPAddress?.Equals(IPAddress.IPv6Any) == true)
+                    {
+                        DebugMessage(
+                            nameof(IsInternalAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [0000:]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    if (socketAddress.Address?.IPAddress?.Equals(IPAddress.IPv6Loopback) == true)
+                    {
+                        DebugMessage(
+                            nameof(IsInternalAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [Loop Back]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    break;
+            }
+
+            return false;
         }
 
         private bool IsIpInRange(IPAddress address, IPAddress lowerRange, IPAddress upperRange)
@@ -574,21 +593,166 @@ namespace NetworkAdapterSelector.Hook
             return true;
         }
 
+        private bool IsSocketMarkedAsBinded(IntPtr socket)
+        {
+            lock (SocketLookupTable)
+            {
+                if (SocketLookupTable.ContainsKey(socket))
+                {
+                    return SocketLookupTable[socket];
+                }
+            }
+
+            return false;
+        }
+
+        private bool IsSpecialAddress(IntPtr socket, ISocketAddress socketAddress)
+        {
+            if (IsInternalAddress(socket, socketAddress))
+            {
+                return true;
+            }
+
+            switch (socketAddress?.AddressFamily)
+            {
+                case AddressFamily.InterNetwork:
+
+                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("10.0.0.0"),
+                        IPAddress.Parse("10.255.255.255")))
+                    {
+                        DebugMessage(
+                            nameof(IsSpecialAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [Private Range]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("172.16.0.0"),
+                        IPAddress.Parse("172.31.255.255")))
+                    {
+                        DebugMessage(
+                            nameof(IsSpecialAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [Private Range]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("192.168.0.0"),
+                        IPAddress.Parse("192.168.255.255")))
+                    {
+                        DebugMessage(
+                            nameof(IsSpecialAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [Private Range]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("169.254.1.0"),
+                        IPAddress.Parse("169.254.254.255")))
+                    {
+                        DebugMessage(
+                            nameof(IsSpecialAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [Link Local Network]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    if (IsIpInRange(socketAddress.Address?.IPAddress, IPAddress.Parse("224.0.0.0"),
+                        IPAddress.Parse("239.255.255.255")))
+                    {
+                        DebugMessage(
+                            nameof(IsSpecialAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [MultiCast Address]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    break;
+                case AddressFamily.InterNetworkV6:
+
+                    if (IsIpInRange(socketAddress.Address?.IPAddress,
+                        IPAddress.Parse("fc00:0000:0000:0000:0000:0000:0000:0000"),
+                        IPAddress.Parse("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")))
+                    {
+                        DebugMessage(
+                            nameof(IsSpecialAddress),
+                            socket,
+                            "Binding to interface skipped due to the nature of passed IP Address. [fc00:]"
+                        );
+
+                        {
+                            return true;
+                        }
+                    }
+
+                    break;
+                default:
+                    DebugMessage(
+                        nameof(IsSpecialAddress),
+                        socket,
+                        "Binding to interface skipped due an unsupported address family of `{0}`.",
+                        socketAddress?.AddressFamily
+                    );
+
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private void LoadLibrary(string libraryName, Action code)
         {
             // Forcing the hook by pre-loading the desired library
-            var library = Library.LoadLibrary(libraryName);
+            var library = NativeLibrary.LoadLibrary(libraryName);
             code();
 
             // Unload the library only if we were the one loading it for the first time
             if (!library.Equals(IntPtr.Zero))
             {
-                Library.FreeLibrary(library);
+                NativeLibrary.FreeLibrary(library);
                 DebugMessage(
                     nameof(LoadLibrary),
+                    null,
                     "Library `{1}` loaded and unloaded to override hooked function addresses.",
                     libraryName
                 );
+            }
+        }
+
+        private void MarkSocketAsBinded(IntPtr socket)
+        {
+            lock (SocketLookupTable)
+            {
+                if (!SocketLookupTable.ContainsKey(socket))
+                {
+                    SocketLookupTable.Add(socket, true);
+                }
+                else
+                {
+                    SocketLookupTable[socket] = true;
+                }
             }
         }
 
@@ -598,94 +762,134 @@ namespace NetworkAdapterSelector.Hook
 
             DebugMessage(
                 nameof(OnBind),
+                socket,
                 "Binding to `{0}:{1}` ...",
                 socketAddress?.Address?.IPAddress,
                 socketAddress?.Port
             );
 
-            var networkInterface = GetNetworkInterface();
-            var interfaceAddress = GetInterfaceAddress(networkInterface, socketAddress?.AddressFamily, true);
-
-            if (socketAddress?.Address == null || networkInterface == null || interfaceAddress == null)
-            {
-                DebugMessage(
-                    nameof(OnBind),
-                    "Binding to `{0}:{1}` rejected due to lack of a valid interface address.",
-                    socketAddress?.Address?.IPAddress,
-                    socketAddress?.Port
-                );
-
-                return SocketError.SocketError;
-            }
-
             SocketError bindResult;
 
-            if (interfaceAddress.AddressFamily == AddressFamily.InterNetwork &&
-                !interfaceAddress.Equals(socketAddress.Address.IPAddress))
+            if (IsInternalAddress(socket, socketAddress))
             {
-                var bindIn = new SocketAddressIn
-                {
-                    Address = new AddressIn {IPAddress = interfaceAddress},
-                    AddressFamily = interfaceAddress.AddressFamily,
-                    Port = socketAddress.Port
-                };
-
-                DebugMessage(
-                    nameof(OnBind),
-                    "Binding to `{0}:{1}` replaced by a binding request to `{2}:{3}`.",
-                    socketAddress.Address.IPAddress,
-                    socketAddress.Port,
-                    bindIn.Address.IPAddress,
-                    bindIn.Port
-                );
-
-                socketAddress = bindIn;
-
-                bindResult = Socket.Bind(socket, ref bindIn, Marshal.SizeOf(bindIn));
-            }
-            else if (interfaceAddress.AddressFamily == AddressFamily.InterNetworkV6 &&
-                     !interfaceAddress.Equals(socketAddress.Address.IPAddress))
-            {
-                var scopeId = (uint?) networkInterface.GetIPProperties()?.GetIPv6Properties()?.Index ?? 0;
-                var flowInfo = (socketAddress as SocketAddressIn6?)?.FlowInfo ?? 0;
-
-                var bindIn6 = new SocketAddressIn6
-                {
-                    Address = new AddressIn6 {IPAddress = interfaceAddress},
-                    AddressFamily = interfaceAddress.AddressFamily,
-                    Port = socketAddress.Port, // Assign a random port
-                    ScopeId = scopeId,
-                    FlowInfo = flowInfo
-                };
-
-                DebugMessage(
-                    nameof(OnBind),
-                    "Binding to `{0}:{1}` replaced by a binding request to `{2}:{3}`.",
-                    socketAddress.Address.IPAddress,
-                    socketAddress.Port,
-                    bindIn6.Address.IPAddress,
-                    bindIn6.Port
-                );
-
-                socketAddress = bindIn6;
-
-                bindResult = Socket.Bind(socket, ref bindIn6, Marshal.SizeOf(bindIn6));
+                bindResult = NativeSocket.Bind(socket, address, addressSize);
             }
             else
             {
-                bindResult = Socket.Bind(socket, address, addressSize);
+                var networkInterface = GetNetworkInterface();
+                var interfaceAddress = GetInterfaceAddress(networkInterface, socketAddress?.AddressFamily, true);
+
+                if (socketAddress?.Address == null || networkInterface == null || interfaceAddress == null)
+                {
+                    DebugMessage(
+                        nameof(OnBind),
+                        socket,
+                        "Binding to `{0}:{1}` rejected due to lack of a valid interface address.",
+                        socketAddress?.Address?.IPAddress,
+                        socketAddress?.Port
+                    );
+
+                    return SocketError.SocketError;
+                }
+
+
+                if (interfaceAddress.AddressFamily == AddressFamily.InterNetwork &&
+                    !interfaceAddress.Equals(socketAddress.Address.IPAddress))
+                {
+                    var bindIn = new SocketAddressIn
+                    {
+                        Address = new AddressIn {IPAddress = interfaceAddress},
+                        AddressFamily = interfaceAddress.AddressFamily,
+                        Port = socketAddress.Port
+                    };
+
+                    DebugMessage(
+                        nameof(OnBind),
+                        socket,
+                        "Binding to `{0}:{1}` replaced by a binding request to `{2}:{3}`.",
+                        socketAddress.Address.IPAddress,
+                        socketAddress.Port,
+                        bindIn.Address.IPAddress,
+                        bindIn.Port
+                    );
+
+                    MarkSocketAsBinded(socket);
+
+                    socketAddress = bindIn;
+
+                    bindResult = NativeSocket.Bind(socket, ref bindIn, Marshal.SizeOf(bindIn));
+                }
+                else if (interfaceAddress.AddressFamily == AddressFamily.InterNetworkV6 &&
+                         !interfaceAddress.Equals(socketAddress.Address.IPAddress))
+                {
+                    var scopeId = (uint?) networkInterface.GetIPProperties()?.GetIPv6Properties()?.Index ?? 0;
+                    var flowInfo = (socketAddress as SocketAddressIn6?)?.FlowInfo ?? 0;
+
+                    var bindIn6 = new SocketAddressIn6
+                    {
+                        Address = new AddressIn6 {IPAddress = interfaceAddress},
+                        AddressFamily = interfaceAddress.AddressFamily,
+                        Port = socketAddress.Port, // Assign a random port
+                        ScopeId = scopeId,
+                        FlowInfo = flowInfo
+                    };
+
+                    DebugMessage(
+                        nameof(OnBind),
+                        socket,
+                        "Binding to `{0}:{1}` replaced by a binding request to `{2}:{3}`.",
+                        socketAddress.Address.IPAddress,
+                        socketAddress.Port,
+                        bindIn6.Address.IPAddress,
+                        bindIn6.Port
+                    );
+
+                    MarkSocketAsBinded(socket);
+
+                    socketAddress = bindIn6;
+
+                    bindResult = NativeSocket.Bind(socket, ref bindIn6, Marshal.SizeOf(bindIn6));
+                }
+                else
+                {
+                    bindResult = NativeSocket.Bind(socket, address, addressSize);
+                }
             }
 
             DebugMessage(
                 nameof(OnBind),
+                socket,
                 "Binding to `{0}:{1}` resulted in a `{2}` response. [WSALastError = `{3}`]",
-                socketAddress.Address.IPAddress,
-                socketAddress.Port,
+                socketAddress?.Address?.IPAddress,
+                socketAddress?.Port,
                 bindResult,
-                Socket.WSAGetLastError()
+                NativeSocket.WSAGetLastError()
             );
 
             return bindResult;
+        }
+
+        private SocketError OnCloseSocket(IntPtr socket)
+        {
+            var result = NativeSocket.CloseSocket(socket);
+
+            if (socket != IntPtr.Zero && (result == SocketError.Success || result == SocketError.WouldBlock))
+            {
+                lock (SocketLookupTable)
+                {
+                    if (SocketLookupTable.ContainsKey(socket))
+                    {
+                        DebugMessage(
+                            nameof(OnCloseSocket),
+                            socket,
+                            "Socket destroyed."
+                        );
+                        SocketLookupTable.Remove(socket);
+                    }
+                }
+            }
+
+            return result;
         }
 
         private SocketError OnConnect(IntPtr socket, IntPtr address, int addressSize)
@@ -694,6 +898,7 @@ namespace NetworkAdapterSelector.Hook
 
             DebugMessage(
                 nameof(OnConnect),
+                socket,
                 "Connecting to `{0}:{1}` ...",
                 socketAddress?.Address?.IPAddress,
                 socketAddress?.Port
@@ -703,22 +908,28 @@ namespace NetworkAdapterSelector.Hook
 
             DebugMessage(
                 nameof(OnConnect),
+                socket,
                 "Binding `{0}:{1}` to interface resulted in a `{2}` response. [WSALastError = `{3}`]",
                 socketAddress?.Address?.IPAddress,
                 socketAddress?.Port,
                 bindResult,
-                Socket.WSAGetLastError()
+                NativeSocket.WSAGetLastError()
             );
 
             if (bindResult != SocketError.Success)
             {
                 if (bindResult != SocketError.SocketError)
                 {
-                    DebugMessage(nameof(OnConnect), Socket.WSAGetLastError().ToString());
+                    DebugMessage(
+                        nameof(OnConnect),
+                        socket,
+                        NativeSocket.WSAGetLastError().ToString()
+                    );
                 }
 
                 DebugMessage(
                     nameof(OnConnect),
+                    socket,
                     "Connecting to `{0}:{1}` rejected.",
                     socketAddress?.Address?.IPAddress,
                     socketAddress?.Port
@@ -727,15 +938,16 @@ namespace NetworkAdapterSelector.Hook
                 return SocketError.SocketError;
             }
 
-            var returnValue = Socket.Connect(socket, address, addressSize);
+            var returnValue = NativeSocket.Connect(socket, address, addressSize);
 
             DebugMessage(
                 nameof(OnConnect),
+                socket,
                 "Connecting to `{0}:{1}` resulted in a `{2}` response. [WSALastError = `{3}`]",
                 socketAddress?.Address?.IPAddress,
                 socketAddress?.Port,
                 returnValue,
-                Socket.WSAGetLastError()
+                NativeSocket.WSAGetLastError()
             );
 
             //if (returnValue == SocketError.SocketError && Socket.WSAGetLastError() == SocketError.Success)
@@ -761,7 +973,7 @@ namespace NetworkAdapterSelector.Hook
             bool isUnicode)
         {
             var resultValue = isUnicode
-                ? UnManaged.Process.CreateProcessW(
+                ? NativeProcess.CreateProcessW(
                     applicationName,
                     commandLine,
                     processAttributes,
@@ -773,7 +985,7 @@ namespace NetworkAdapterSelector.Hook
                     startupInfo,
                     out processInformation
                 )
-                : UnManaged.Process.CreateProcessA(
+                : NativeProcess.CreateProcessA(
                     applicationName,
                     commandLine,
                     processAttributes,
@@ -798,8 +1010,11 @@ namespace NetworkAdapterSelector.Hook
 
             var processId = processInformation.ProcessId;
 
-            DebugMessage(nameof(OnCreateProcess), "A new process with identification number of #{0} is created.",
-                processId);
+            DebugMessage(nameof(OnCreateProcess),
+                null,
+                "A new process with identification number of #{0} is created.",
+                processId
+            );
 
             new Thread(() =>
             {
@@ -820,7 +1035,12 @@ namespace NetworkAdapterSelector.Hook
                             !string.IsNullOrWhiteSpace(LogPath)
                         );
 
-                        DebugMessage(nameof(OnCreateProcess), "Process #{0} injected with the guest code.", processId);
+                        DebugMessage(
+                            nameof(OnCreateProcess),
+                            null,
+                            "Process #{0} injected with the guest code.",
+                            processId
+                        );
 
                         return;
                     }
@@ -835,8 +1055,12 @@ namespace NetworkAdapterSelector.Hook
                             continue;
                         }
 
-                        DebugMessage(nameof(OnCreateProcess), "Failed to inject the guest code to process #{0}.",
-                            processId);
+                        DebugMessage(
+                            nameof(OnCreateProcess),
+                            null,
+                            "Failed to inject the guest code to process #{0}.",
+                            processId
+                        );
 
                         return;
                     }
@@ -846,17 +1070,51 @@ namespace NetworkAdapterSelector.Hook
             return true;
         }
 
+        private IntPtr OnOpenSocket(AddressFamily addressFamily, SocketType type, ProtocolType protocol)
+        {
+            var socket = NativeSocket.OpenSocket(addressFamily, type, protocol);
+
+            if (socket != IntPtr.Zero)
+            {
+                lock (SocketLookupTable)
+                {
+                    if (!SocketLookupTable.ContainsKey(socket))
+                    {
+                        DebugMessage(
+                            nameof(OnOpenSocket),
+                            socket,
+                            "New socket created."
+                        );
+                        SocketLookupTable.Add(socket, false);
+                    }
+                }
+            }
+
+            return socket;
+        }
+
         private bool OnSetWindowText(IntPtr windowHandle, IntPtr text, bool unicode)
         {
             var title = unicode ? Marshal.PtrToStringUni(text) : Marshal.PtrToStringAnsi(text);
 
+            if (!ChangeWindowTitle)
+            {
+                return NativeWindow.SetWindowText(windowHandle, title);
+            }
+
             if (!string.IsNullOrEmpty(title) && windowHandle.Equals(ActiveWindow))
             {
-                DebugMessage(nameof(OnSetWindowText), "Window #{0} title changing to `{1}`.", windowHandle, title);
+                DebugMessage(
+                    nameof(OnSetWindowText),
+                    null,
+                    "Window #{0} title changing to `{1}`.",
+                    windowHandle,
+                    title
+                );
                 title = WindowTitle.AppendWindowTitle(title, GenerateCaptionText());
             }
 
-            return Window.SetWindowText(windowHandle, title);
+            return NativeWindow.SetWindowText(windowHandle, title);
         }
 
 
@@ -874,6 +1132,7 @@ namespace NetworkAdapterSelector.Hook
 
             DebugMessage(
                 nameof(OnWSAConnect),
+                socket,
                 "Connecting to `{0}:{1}` ...",
                 socketAddress?.Address?.IPAddress,
                 socketAddress?.Port
@@ -883,22 +1142,28 @@ namespace NetworkAdapterSelector.Hook
 
             DebugMessage(
                 nameof(OnWSAConnect),
+                socket,
                 "Binding `{0}:{1}` to interface resulted in a `{2}` response. [WSALastError = `{3}`]",
                 socketAddress?.Address?.IPAddress,
                 socketAddress?.Port,
                 bindResult,
-                Socket.WSAGetLastError()
+                NativeSocket.WSAGetLastError()
             );
 
             if (bindResult != SocketError.Success)
             {
                 if (bindResult != SocketError.SocketError)
                 {
-                    DebugMessage(nameof(OnWSAConnect), Socket.WSAGetLastError().ToString());
+                    DebugMessage(
+                        nameof(OnWSAConnect),
+                        socket,
+                        NativeSocket.WSAGetLastError().ToString()
+                    );
                 }
 
                 DebugMessage(
                     nameof(OnWSAConnect),
+                    socket,
                     "Connecting to `{0}:{1}` rejected.",
                     socketAddress?.Address?.IPAddress,
                     socketAddress?.Port
@@ -907,15 +1172,16 @@ namespace NetworkAdapterSelector.Hook
                 return SocketError.SocketError;
             }
 
-            var returnValue = Socket.WSAConnect(socket, address, addressSize, inBuffer, outBuffer, sQos, gQos);
+            var returnValue = NativeSocket.WSAConnect(socket, address, addressSize, inBuffer, outBuffer, sQos, gQos);
 
             DebugMessage(
                 nameof(OnWSAConnect),
+                socket,
                 "Connecting to `{0}:{1}` resulted in a `{2}` response. [WSALastError = `{3}`]",
                 socketAddress?.Address?.IPAddress,
                 socketAddress?.Port,
                 returnValue,
-                Socket.WSAGetLastError()
+                NativeSocket.WSAGetLastError()
             );
 
             //if (returnValue == SocketError.SocketError && Socket.WSAGetLastError() == SocketError.Success)
@@ -924,6 +1190,39 @@ namespace NetworkAdapterSelector.Hook
             //}
 
             return returnValue;
+        }
+
+        // ReSharper disable once TooManyArguments
+        private IntPtr OnWSAOpenSocket(
+            AddressFamily addressFamily,
+            SocketType type,
+            ProtocolType protocol,
+            IntPtr protocolInfo,
+            int groupId,
+            short flags,
+            bool isUnicode)
+        {
+            var socket = isUnicode
+                ? NativeSocket.WSAOpenSocketW(addressFamily, type, protocol, protocolInfo, groupId, flags)
+                : NativeSocket.WSAOpenSocketA(addressFamily, type, protocol, protocolInfo, groupId, flags);
+
+            if (socket != IntPtr.Zero)
+            {
+                lock (SocketLookupTable)
+                {
+                    if (!SocketLookupTable.ContainsKey(socket))
+                    {
+                        DebugMessage(
+                            nameof(OnWSAOpenSocket),
+                            socket,
+                            "New socket created."
+                        );
+                        SocketLookupTable.Add(socket, false);
+                    }
+                }
+            }
+
+            return socket;
         }
 
         private void WindowTitleCheckLoop()
@@ -947,6 +1246,7 @@ namespace NetworkAdapterSelector.Hook
                             {
                                 DebugMessage(
                                     nameof(WindowTitleCheckLoop),
+                                    null,
                                     "Main window changed from #{0} to #{1}. Cleaning old window's title bar.",
                                     ActiveWindow,
                                     mainWindowHandler
@@ -974,11 +1274,15 @@ namespace NetworkAdapterSelector.Hook
                 }
                 catch (Exception e)
                 {
-                    // Ignoring the InvalidOperationException as it happens a lot when program don't have 
+                    // Ignoring the InvalidOperationException as it happens a lot when program don't have
                     // a valid window
                     if (!(e is InvalidOperationException))
                     {
-                        DebugMessage(nameof(WindowTitleCheckLoop), e.ToString());
+                        DebugMessage(
+                            nameof(WindowTitleCheckLoop),
+                            null,
+                            e.ToString()
+                        );
                     }
 
                     Thread.Sleep(1000);
